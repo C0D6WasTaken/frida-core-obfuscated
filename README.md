@@ -1,5 +1,6 @@
 ## Objective of this fork:
 - Obfuscate strings within frida-gadget to prevent detection
+
 Currently under development.
 
 # frida-core
