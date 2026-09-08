@@ -32,6 +32,7 @@ namespace Frida.Barebone {
 		private const uint L1_ENTRY_SIZE = 4;
 		private const uint L1_SHIFT = 20;
 		private const uint L1_ALIGN_BITS = 14;
+		private const uint KERNEL_FIRST_L1_INDEX = L1_NUM_ENTRIES / 4 * 3;
 		private const uint32 L1_KIND_MASK = 3;
 		private const uint32 L1_KIND_FAULT = 0;
 		private const uint32 L1_KIND_TABLE = 1;
@@ -113,7 +114,7 @@ namespace Frida.Barebone {
 
 			MMUParameters p = yield MMUParameters.load (gdb, cancellable);
 
-			yield set_addressing_mode (gdb, PHYSICAL, cancellable);
+			bool was_running = yield enter_physical_addressing (gdb, cancellable);
 			GLib.Error? failure = null;
 			try {
 				uint boundary = p.split_index;
@@ -123,7 +124,7 @@ namespace Frida.Barebone {
 			} catch (GLib.Error e) {
 				failure = e;
 			}
-			yield set_addressing_mode (gdb, VIRTUAL, cancellable);
+			yield leave_physical_addressing (gdb, was_running, cancellable);
 			throw_if_failed (failure);
 
 			return result;
@@ -208,7 +209,7 @@ namespace Frida.Barebone {
 
 			MMUParameters p = yield MMUParameters.load (gdb, cancellable);
 
-			yield set_addressing_mode (gdb, PHYSICAL, cancellable);
+			bool was_running = yield enter_physical_addressing (gdb, cancellable);
 			GLib.Error? failure = null;
 			bool written = false;
 			try {
@@ -219,7 +220,7 @@ namespace Frida.Barebone {
 			} catch (GLib.Error e) {
 				failure = e;
 			}
-			yield set_addressing_mode (gdb, VIRTUAL, cancellable);
+			yield leave_physical_addressing (gdb, was_running, cancellable);
 			throw_if_failed (failure);
 
 			if (!written)
@@ -253,6 +254,28 @@ namespace Frida.Barebone {
 				cancellable);
 			if (table != null)
 				kernel_page_table_pa = table;
+		}
+
+		public override async uint64 translate_address (uint64 va, Cancellable? cancellable) throws Error, IOError {
+			MMUParameters p = yield MMUParameters.load (gdb, cancellable);
+
+			bool was_running = yield enter_physical_addressing (gdb, cancellable);
+			uint64? pa = null;
+			GLib.Error? failure = null;
+			try {
+				yield locate_kernel_page_table (p, cancellable);
+
+				pa = yield translate_in_table (yield table_describing (va, p, cancellable), va, cancellable);
+			} catch (GLib.Error e) {
+				failure = e;
+			}
+			yield leave_physical_addressing (gdb, was_running, cancellable);
+			throw_if_failed (failure);
+
+			if (pa == null)
+				throw new Error.INVALID_ARGUMENT ("Address 0x%x is not mapped", (uint) va);
+
+			return pa;
 		}
 
 		private async uint64 table_describing (uint64 va, MMUParameters p, Cancellable? cancellable)
@@ -348,7 +371,7 @@ namespace Frida.Barebone {
 
 			uint num_pages = physical_addresses.size;
 
-			yield set_addressing_mode (gdb, PHYSICAL, cancellable);
+			bool was_running = yield enter_physical_addressing (gdb, cancellable);
 			var run = new Run (num_pages);
 
 			Allocation? allocation = null;
@@ -359,7 +382,7 @@ namespace Frida.Barebone {
 			} catch (GLib.Error e) {
 				failure = e;
 			}
-			yield set_addressing_mode (gdb, VIRTUAL, cancellable);
+			yield leave_physical_addressing (gdb, was_running, cancellable);
 			throw_if_failed (failure);
 
 			if (allocation == null)
@@ -370,11 +393,19 @@ namespace Frida.Barebone {
 
 		private async bool scan_for_run (Run run, MMUParameters p, Cancellable? cancellable) throws Error, IOError {
 			uint boundary = p.split_index;
-			if (yield scan_for_run_in_l1 (run, p.tt0, 0, boundary, p, cancellable))
-				return true;
-			if (boundary != L1_NUM_ENTRIES)
-				return yield scan_for_run_in_l1 (run, p.tt1, boundary, L1_NUM_ENTRIES, p, cancellable);
-			return false;
+
+			if (boundary != L1_NUM_ENTRIES) {
+				if (yield scan_for_run_in_l1 (run, p.tt1, boundary, L1_NUM_ENTRIES, p, cancellable))
+					return true;
+			} else {
+				if (yield scan_for_run_in_l1 (run, p.tt0, KERNEL_FIRST_L1_INDEX, L1_NUM_ENTRIES, p,
+						cancellable))
+					return true;
+			}
+
+			run.reset ();
+
+			return yield scan_for_run_in_l1 (run, p.tt0, 0, boundary, p, cancellable);
 		}
 
 		private async bool scan_for_run_in_l1 (Run run, uint64 table_address, uint first_index, uint end_index,
@@ -437,7 +468,7 @@ namespace Frida.Barebone {
 			uint64 start_va = page_start (virtual_address, SMALL_PAGE_SIZE);
 			uint64 end_va = round_address_up (virtual_address + size, SMALL_PAGE_SIZE);
 
-			yield set_addressing_mode (gdb, PHYSICAL, cancellable);
+			bool was_running = yield enter_physical_addressing (gdb, cancellable);
 			GLib.Error? failure = null;
 			try {
 				yield locate_kernel_page_table (p, cancellable);
@@ -480,7 +511,7 @@ namespace Frida.Barebone {
 			} catch (GLib.Error e) {
 				failure = e;
 			}
-			yield set_addressing_mode (gdb, VIRTUAL, cancellable);
+			yield leave_physical_addressing (gdb, was_running, cancellable);
 			throw_if_failed (failure);
 		}
 
@@ -618,7 +649,7 @@ namespace Frida.Barebone {
 			}
 
 			public async void deallocate (Cancellable? cancellable) throws Error, IOError {
-				yield set_addressing_mode (machine.gdb, PHYSICAL, cancellable);
+				bool was_running = yield enter_physical_addressing (machine.gdb, cancellable);
 				GLib.Error? failure = null;
 				try {
 					foreach (DisplacedEntries d in displaced)
@@ -626,7 +657,7 @@ namespace Frida.Barebone {
 				} catch (GLib.Error e) {
 					failure = e;
 				}
-				yield set_addressing_mode (machine.gdb, VIRTUAL, cancellable);
+				yield leave_physical_addressing (machine.gdb, was_running, cancellable);
 				throw_if_failed (failure);
 			}
 		}

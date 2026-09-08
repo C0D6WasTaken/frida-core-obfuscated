@@ -24,6 +24,7 @@ use crate::{
     gum::{self, FoundExportCallback},
     host_rpc, kernel, libc,
 };
+use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::vec::Vec;
 use core::ffi::CStr;
@@ -46,9 +47,7 @@ const MODULE_DIRECTORY: &str = "/lib/modules/";
 #[cfg(feature = "linux-injected")]
 const MODULE_SUFFIX: &str = ".ko";
 
-const SHADOW_MAGIC: u64 = 0x4644_4f48_5341_4853;
 const SHADOW_HEADER: usize = 24;
-const SHADOW_MIN_ADDRESS: u64 = 0xffff_f000_0000_0000;
 
 #[cfg(feature = "xnu-core")]
 #[unsafe(no_mangle)]
@@ -65,11 +64,11 @@ pub extern "C" fn gum_barebone_query_platform() -> *const crate::bindings::gchar
 #[cfg(feature = "linux-injected")]
 #[unsafe(no_mangle)]
 pub extern "C" fn gum_barebone_query_stack_size() -> crate::bindings::gsize {
-    if crate::on_js_thread() {
-        crate::linux::STACK_SIZE as crate::bindings::gsize
-    } else {
-        0
+    if kernel::in_copy() {
+        return if crate::on_js_thread() { crate::linux::STACK_SIZE as crate::bindings::gsize } else { 0 };
     }
+
+    crate::linux::stack_headroom() as crate::bindings::gsize
 }
 
 #[cfg(feature = "xnu-core")]
@@ -153,15 +152,23 @@ fn shadow_kernel_pages(first_page: gpointer, n_pages: guint) -> gpointer {
     unsafe {
         let total = n_pages as usize * gum_query_page_size() as usize;
         let buffer = kernel::alloc(SHADOW_HEADER + total);
-        *(buffer as *mut u64) = SHADOW_MAGIC;
         *(buffer.add(8) as *mut u64) = first_page as u64;
         *(buffer.add(16) as *mut u32) = n_pages;
 
         let body = buffer.add(SHADOW_HEADER);
         core::ptr::copy_nonoverlapping(first_page as *const u8, body, total);
+
+        shadows().insert(body as u64);
+
         body as gpointer
     }
 }
+
+fn shadows() -> &'static mut BTreeSet<u64> {
+    unsafe { core::ptr::addr_of_mut!(SHADOWS).as_mut().unwrap() }
+}
+
+static mut SHADOWS: BTreeSet<u64> = BTreeSet::new();
 
 #[unsafe(no_mangle)]
 pub extern "C" fn gum_memory_dispose_writable_pages(writable: gpointer, _n_pages: guint) {
@@ -174,14 +181,11 @@ pub extern "C" fn gum_memory_dispose_writable_pages(writable: gpointer, _n_pages
         return;
     }
 
-    if (writable as u64) < SHADOW_MIN_ADDRESS {
+    if !shadows().remove(&(writable as u64)) {
         return;
     }
     unsafe {
         let buffer = (writable as *mut u8).sub(SHADOW_HEADER);
-        if *(buffer as *const u64) != SHADOW_MAGIC {
-            return;
-        }
         let first_page = *(buffer.add(8) as *const u64);
         let n_pages = *(buffer.add(16) as *const u32);
         let total = n_pages as usize * gum_query_page_size() as usize;
@@ -220,10 +224,15 @@ pub extern "C" fn gum_barebone_try_remap_writable_pages(
         return ptr::null_mut();
     }
     unsafe {
+        let mut wide = Vec::with_capacity(n_addrs as usize);
+        for i in 0..n_addrs as usize {
+            wide.push(*addrs.add(i) as u64);
+        }
+
         let element_type = g_variant_type_new(c"t".as_ptr());
         let payload = g_variant_new_fixed_array(
             element_type,
-            addrs as gconstpointer,
+            wide.as_ptr() as gconstpointer,
             n_addrs as gsize,
             size_of::<u64>() as gsize,
         );
@@ -624,7 +633,7 @@ pub extern "C" fn _gum_process_enumerate_ranges(
         return;
     };
 
-    kernel::enumerate_ranges(&mut |base, size, protection| {
+    let mut report = |base: u64, size: u64, protection: u32| {
         if (protection & prot as u32) != prot as u32 {
             return;
         }
@@ -640,7 +649,27 @@ pub extern "C" fn _gum_process_enumerate_ranges(
         };
 
         unsafe { emit(&details, user_data) };
-    });
+    };
+
+    #[cfg(feature = "linux-injected")]
+    if !kernel::in_copy() {
+        each_kernel_module_range(|base, size| report(base, size, KERNEL_RANGE_PROTECTION));
+        return;
+    }
+
+    kernel::enumerate_ranges(&mut |base, size, protection| report(base, size as u64, protection));
+}
+
+#[cfg(feature = "linux-injected")]
+const KERNEL_RANGE_PROTECTION: u32 = 1 | 2 | 4;
+
+#[cfg(feature = "linux-injected")]
+fn each_kernel_module_range(mut visit: impl FnMut(u64, u64)) {
+    let kernel_base = kernel::get_kernel_base();
+    let module_infos = unsafe { &*core::ptr::addr_of!(crate::MODULE_INFO) };
+    for module_info in module_infos.iter() {
+        visit(kernel_base + module_info.offset, module_info.size);
+    }
 }
 
 #[cfg(any(feature = "linux-injected", feature = "xnu-core"))]
@@ -649,6 +678,21 @@ pub extern "C" fn gum_memory_query_protection(
     address: gpointer,
     prot: *mut GumPageProtection,
 ) -> gboolean {
+    #[cfg(feature = "linux-injected")]
+    if !kernel::in_copy() {
+        let mut protection = 0u32;
+        each_kernel_module_range(|base, size| {
+            if address as u64 >= base && (address as u64) < base + size {
+                protection = KERNEL_RANGE_PROTECTION;
+            }
+        });
+        if protection == 0 {
+            return 0;
+        }
+        unsafe { *prot = protection as GumPageProtection };
+        return 1;
+    }
+
     let protection = kernel::protection_at(address as u64);
     if protection == 0 {
         return 0;

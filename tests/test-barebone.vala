@@ -634,6 +634,18 @@ namespace Frida.BareboneTest {
 			h.run ();
 		});
 
+		GLib.Test.add_func ("/Barebone/X64/probe", () => {
+			var h = new Harness ((h) => xnu_probe.begin (
+				h as Harness, linux_config_from_environment (h as Harness, "LINUX_X86_64")));
+			h.run ();
+		});
+
+		GLib.Test.add_func ("/Barebone/X64/probe-user", () => {
+			var h = new Harness ((h) => linux_probe_user.begin (
+				h as Harness, linux_config_from_environment (h as Harness, "LINUX_X86_64")));
+			h.run ();
+		});
+
 		GLib.Test.add_func ("/Barebone/Xnu/hooks-its-own-process-in-live-guest", () => {
 			var h = new Harness ((h) => xnu_hooks_its_own_process_in_live_guest.begin (
 				h as Harness, xnu_config_from_environment (h as Harness)));
@@ -778,6 +790,11 @@ namespace Frida.BareboneTest {
 			h.run ();
 		});
 
+		GLib.Test.add_func ("/Barebone/ARM/rpc-replies-in-live-guest", () => {
+			var h = new Harness ((h) => linux_rpc_replies_in_live_guest.begin (h as Harness, "LINUX_ARM"));
+			h.run ();
+		});
+
 		GLib.Test.add_func ("/Barebone/ARM/injects-into-process-in-live-guest", () => {
 			var h = new Harness ((h) => linux_injects_into_process_in_live_guest.begin (h as Harness,
 				"LINUX_ARM"));
@@ -790,6 +807,16 @@ namespace Frida.BareboneTest {
 			h.run ();
 		});
 
+		GLib.Test.add_func ("/Barebone/ARM64/agent-runs-in-live-guest", () => {
+			var h = new Harness ((h) => linux_agent_runs_in_live_guest.begin (h as Harness, "LINUX_ARM64"));
+			h.run ();
+		});
+
+		GLib.Test.add_func ("/Barebone/ARM64/rpc-replies-in-live-guest", () => {
+			var h = new Harness ((h) => linux_rpc_replies_in_live_guest.begin (h as Harness, "LINUX_ARM64"));
+			h.run ();
+		});
+
 		GLib.Test.add_func ("/Barebone/IA32/agent-runs-in-live-guest", () => {
 			var h = new Harness ((h) => linux_agent_runs_in_live_guest.begin (h as Harness, "LINUX_X86"));
 			h.run ();
@@ -798,6 +825,11 @@ namespace Frida.BareboneTest {
 		GLib.Test.add_func ("/Barebone/IA32/agent-recovers-from-exception-in-live-guest", () => {
 			var h = new Harness ((h) => linux_agent_recovers_from_exception_in_live_guest.begin (h as Harness,
 				"LINUX_X86"));
+			h.run ();
+		});
+
+		GLib.Test.add_func ("/Barebone/IA32/rpc-replies-in-live-guest", () => {
+			var h = new Harness ((h) => linux_rpc_replies_in_live_guest.begin (h as Harness, "LINUX_X86"));
 			h.run ();
 		});
 
@@ -815,6 +847,11 @@ namespace Frida.BareboneTest {
 
 		GLib.Test.add_func ("/Barebone/X64/agent-runs-in-live-guest", () => {
 			var h = new Harness ((h) => linux_agent_runs_in_live_guest.begin (h as Harness, "LINUX_X86_64"));
+			h.run ();
+		});
+
+		GLib.Test.add_func ("/Barebone/X64/rpc-replies-in-live-guest", () => {
+			var h = new Harness ((h) => linux_rpc_replies_in_live_guest.begin (h as Harness, "LINUX_X86_64"));
 			h.run ();
 		});
 
@@ -1285,6 +1322,50 @@ namespace Frida.BareboneTest {
 			}
 		}
 
+		h.done ();
+	}
+
+	private async void linux_probe_user (Harness h, BareboneConfig? config) {
+		if (config == null)
+			return;
+
+		string? path = Environment.get_variable ("FRIDA_PROBE_JS");
+		if (path == null)
+			return;
+
+		string source;
+		try {
+			FileUtils.get_contents (path, out source);
+		} catch (GLib.Error e) {
+			return;
+		}
+
+		h.disable_timeout ();
+
+		var manager = new DeviceManager ();
+		try {
+			var device = yield manager.add_barebone_device (config);
+			uint pid = yield find_program (device, "busybox");
+			assert_true (pid != 0);
+
+			var session = yield device.attach (pid, null, null);
+			var script = yield session.create_script (source, null, null);
+
+			bool finished = false;
+			script.message.connect ((json, data) => {
+				printerr ("\nPROBE %s\n", json);
+				if (json.contains ("done"))
+					finished = true;
+			});
+			yield script.load (null);
+
+			while (!finished)
+				yield h.process_events ();
+		} catch (GLib.Error e) {
+			printerr ("\nFAIL: %s\n\n", e.message);
+		}
+
+		yield h.process_events ();
 		h.done ();
 	}
 
@@ -2376,7 +2457,7 @@ FAIL: %s
 			image.write_uint32 (16, 0x11223344);
 
 			machine.apply_relocation (make_relocation (Gum.ElfX64Relocation.@64, 0), base_va, image);
-			machine.apply_relocation (make_relocation (Gum.ElfX64Relocation.RELATIVE, 8), base_va, image);
+			machine.apply_relocation (make_relocation (Gum.ElfX64Relocation.RELATIVE, 8, 0x80), base_va, image);
 			machine.apply_relocation (make_relocation (Gum.ElfX64Relocation.PC32, 16), base_va, image);
 
 			assert_true (image.read_uint64 (0) == 0xffffffff81000040);
@@ -2960,10 +3041,11 @@ FAIL: %s
 		assert_true (r.protection == prot);
 	}
 
-	private Gum.ElfRelocationDetails make_relocation (uint32 type, uint64 address) {
+	private Gum.ElfRelocationDetails make_relocation (uint32 type, uint64 address, int64 addend = 0) {
 		var r = Gum.ElfRelocationDetails ();
 		r.address = address;
 		r.type = type;
+		r.addend = addend;
 		return r;
 	}
 
@@ -4294,6 +4376,10 @@ FAIL: %s
 	private async void linux_agent_runs_in_live_guest (Harness h, string prefix) {
 		yield run_script_in_live_guest (h, linux_config_from_environment (h, prefix), "send(1 + 1);",
 			"\"payload\":2");
+	}
+
+	private async void linux_rpc_replies_in_live_guest (Harness h, string prefix) {
+		yield call_rpc_in_live_guest (h, linux_config_from_environment (h, prefix));
 	}
 
 	private async void linux_agent_recovers_from_exception_in_live_guest (Harness h, string prefix) {
@@ -5927,6 +6013,57 @@ FAIL: %s
 		}
 
 		return config;
+	}
+
+	private async void call_rpc_in_live_guest (Harness h, BareboneConfig? config) {
+		if (config == null)
+			return;
+
+		var manager = new DeviceManager ();
+		try {
+			var device = yield manager.add_barebone_device (config);
+			var session = yield device.attach (0, null, null);
+			var script = yield session.create_script ("""
+				rpc.exports.evaluate = code => eval(code);
+			""", null, null);
+
+			string? received = null;
+			bool waiting = false;
+			var handler = script.message.connect ((json, data) => {
+				if (!json.contains ("frida:rpc"))
+					return;
+				received = json;
+				if (waiting) {
+					waiting = false;
+					call_rpc_in_live_guest.callback ();
+				}
+			});
+			yield script.load (null);
+
+			script.post ("""["frida:rpc",1,"call","evaluate",["1 + 1"]]""");
+
+			if (received == null) {
+				waiting = true;
+				yield;
+			}
+			script.disconnect (handler);
+
+			if (!received.contains ("\"ok\""))
+				printerr ("\nexpected an ok reply in: %s\n", received);
+			assert_true (received.contains ("\"ok\""));
+
+			yield session.detach (null);
+		} catch (GLib.Error e) {
+			printerr ("\nFAIL: %s\n\n", e.message);
+			assert_not_reached ();
+		} finally {
+			try {
+				yield manager.close (null);
+			} catch (GLib.Error e) {
+			}
+		}
+
+		h.done ();
 	}
 
 	private async void run_script_in_live_guest (Harness h, BareboneConfig? config, string source,

@@ -26,6 +26,7 @@ type BackendRequest struct {
 	Compress         bool     `json:"compress,omitempty"`
 	Platform         string   `json:"platform,omitempty"`
 	Externals        []string `json:"externals,omitempty"`
+	Text             string   `json:"text,omitempty"`
 }
 
 type BackendEvent struct {
@@ -35,13 +36,13 @@ type BackendEvent struct {
 
 	Bundle string `json:"bundle,omitempty"`
 	Error  string `json:"error,omitempty"`
+	Text   string `json:"text,omitempty"`
 
 	Category  string `json:"category,omitempty"`
 	Code      int    `json:"code,omitempty"`
 	Path      string `json:"path,omitempty"`
 	Line      int    `json:"line,omitempty"`
 	Character int    `json:"character,omitempty"`
-	Text      string `json:"text,omitempty"`
 }
 
 func main() {
@@ -58,6 +59,7 @@ func run() error {
 	var outputMu sync.Mutex
 	var sessionsMu sync.Mutex
 	sessions := make(map[uint]*WatchSession)
+	languageServers := make(map[uint]*LanguageServer)
 
 	emit := func(ev BackendEvent) {
 		outputMu.Lock()
@@ -199,6 +201,53 @@ func run() error {
 
 			if session != nil {
 				session.Dispose()
+			}
+
+		case "language-server:open":
+			server, err := NewLanguageServer(req.ProjectRoot, func(text string) {
+				emit(BackendEvent{
+					Type:      "language-server:message",
+					SessionID: req.SessionID,
+					Text:      text,
+				})
+			})
+			if err != nil {
+				emit(BackendEvent{
+					Type:      "language-server:ready",
+					SessionID: req.SessionID,
+					Error:     err.Error(),
+				})
+				continue
+			}
+
+			sessionsMu.Lock()
+			languageServers[req.SessionID] = server
+			sessionsMu.Unlock()
+
+			emit(BackendEvent{
+				Type:      "language-server:ready",
+				SessionID: req.SessionID,
+			})
+
+		case "language-server:close":
+			sessionsMu.Lock()
+			server := languageServers[req.SessionID]
+			delete(languageServers, req.SessionID)
+			sessionsMu.Unlock()
+
+			server.Dispose()
+
+		case "language-server:post":
+			sessionsMu.Lock()
+			server := languageServers[req.SessionID]
+			sessionsMu.Unlock()
+
+			if err := server.Post(req.Text); err != nil {
+				emit(BackendEvent{
+					Type:      "language-server:error",
+					SessionID: req.SessionID,
+					Error:     err.Error(),
+				})
 			}
 
 		default:

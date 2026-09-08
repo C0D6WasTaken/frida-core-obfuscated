@@ -595,9 +595,9 @@ if compiler_backend_opt.allowed()
       endif
     endif
   elif compiler_backend_opt.enabled()
-    error('Need Go >= 1.24 to build the Compiler backend powered by ESBuild and typescript-go')
+    error('Need Go >= 1.26 to build the Compiler backend powered by ESBuild and typescript-go')
   else
-    warning('Building without Compiler backend: Go >= 1.24 not found')
+    warning('Building without Compiler backend: Go >= 1.26 not found')
   endif
 endif
 
@@ -879,6 +879,9 @@ if host_os_family == 'darwin'
 endif
 if host_os == 'macos'
   backend_libs_private += ['-Wl,-framework,AppKit']
+  if have_compiler_backend
+    backend_libs_private += ['-Wl,-framework,CoreServices']
+  endif
 endif
 if host_os in ['ios', 'tvos']
   backend_libs_private += ['-Wl,-framework,CoreGraphics', '-Wl,-framework,UIKit']
