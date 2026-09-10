@@ -59,6 +59,10 @@ pub mod kernel;
 
 #[cfg(feature = "linux")]
 mod gum_linux;
+#[cfg(feature = "linux-injected")]
+mod gum_btf;
+#[cfg(any(feature = "linux", feature = "linux-injected"))]
+mod gum_modules;
 #[cfg(any(feature = "linux", feature = "xnu-kext"))]
 mod hostlink_chardev;
 #[cfg(any(feature = "linux-injected", feature = "xnu-core"))]
@@ -295,7 +299,10 @@ mod entrypoint_blob {
             OWN_RANGE = own_range;
 
             #[cfg(feature = "linux-injected")]
-            kernel::install_fault_reporter();
+            {
+                kernel::install_fault_reporter();
+                crate::gum_btf::publish();
+            }
 
             let wake_token = ptr::addr_of_mut!(glib::WAKEUP_TOKEN) as *const u8;
             // Install this before the loop waits the first time, thus a copy placed in a process later
@@ -341,6 +348,9 @@ mod entrypoint_blob {
             }
 
             transport_get_unchecked().shutdown();
+
+            #[cfg(feature = "linux-injected")]
+            crate::gum_modules::unpublish();
 
             #[cfg(any(feature = "win9x", feature = "winnt", feature = "linux-injected"))]
             {

@@ -24,7 +24,7 @@ use crate::{
     gum::{self, FoundExportCallback},
     host_rpc, kernel, libc,
 };
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::vec::Vec;
 use core::ffi::CStr;
@@ -84,10 +84,9 @@ pub extern "C" fn gum_barebone_query_stack_size() -> crate::bindings::gsize {
 #[unsafe(no_mangle)]
 pub extern "C" fn gum_query_rwx_support() -> GumRwxSupport {
     #[cfg(feature = "linux-injected")]
-    if kernel::in_copy() {
-        return _GumRwxSupport_GUM_RWX_FULL;
-    }
+    return _GumRwxSupport_GUM_RWX_FULL;
 
+    #[cfg(not(feature = "linux-injected"))]
     _GumRwxSupport_GUM_RWX_NONE
 }
 
@@ -116,6 +115,11 @@ pub extern "C" fn gum_memory_try_remap_writable_pages(
         return remap_agent_pages(first_page, n_pages);
     }
 
+    #[cfg(all(feature = "linux-injected", not(target_arch = "arm")))]
+    if writable_in_place(first_page, n_pages) {
+        return first_page;
+    }
+
     #[cfg(not(feature = "xnu-kext"))]
     if gum::is_agent_slab(first_page as u64) {
         return remap_agent_pages(first_page, n_pages);
@@ -129,8 +133,31 @@ fn remap_agent_pages(first_page: gpointer, _n_pages: guint) -> gpointer {
     crate::xnu::the_writable_view_of(first_page as u64) as gpointer
 }
 
+#[cfg(all(feature = "linux-injected", not(target_arch = "arm")))]
+fn writable_in_place(first_page: gpointer, n_pages: guint) -> bool {
+    let size = n_pages as usize * unsafe { gum_query_page_size() } as usize;
+
+    kernel::set_protection(first_page as u64, size, _GumPageProtection_GUM_PAGE_RWX)
+}
+
 #[cfg(not(feature = "xnu-kext"))]
 fn remap_agent_pages(first_page: gpointer, n_pages: guint) -> gpointer {
+    let alias = remap_agent_pages_through_host(first_page, n_pages);
+    if !alias.is_null() {
+        aliases().insert(alias as u64, first_page as u64);
+    }
+
+    alias
+}
+
+fn aliases() -> &'static mut BTreeMap<u64, u64> {
+    unsafe { core::ptr::addr_of_mut!(ALIASES).as_mut().unwrap() }
+}
+
+static mut ALIASES: BTreeMap<u64, u64> = BTreeMap::new();
+
+#[cfg(not(feature = "xnu-kext"))]
+fn remap_agent_pages_through_host(first_page: gpointer, n_pages: guint) -> gpointer {
     unsafe {
         let page_size = gum_query_page_size() as usize;
         let mut virtual_addrs = Vec::with_capacity(n_pages as usize);
@@ -147,6 +174,24 @@ fn remap_agent_pages(first_page: gpointer, n_pages: guint) -> gpointer {
         )
     }
 }
+
+#[cfg(feature = "linux-injected")]
+const _GumPageProtection_GUM_PAGE_RWX: u32 = 7;
+
+unsafe fn what_changed(first_page: u64, shadow: *const u8, total: usize) -> Option<(usize, usize)> {
+    let live = unsafe { core::slice::from_raw_parts(first_page as *const u8, total) };
+    let ours = unsafe { core::slice::from_raw_parts(shadow, total) };
+
+    let first = live.iter().zip(ours).position(|(a, b)| a != b)?;
+    let last = total - live.iter().zip(ours).rev().position(|(a, b)| a != b).unwrap();
+
+    let start = first & !(WORD_SIZE - 1);
+    let end = (last + WORD_SIZE - 1) & !(WORD_SIZE - 1);
+
+    Some((start, end - start))
+}
+
+const WORD_SIZE: usize = 4;
 
 fn shadow_kernel_pages(first_page: gpointer, n_pages: guint) -> gpointer {
     unsafe {
@@ -172,6 +217,7 @@ static mut SHADOWS: BTreeSet<u64> = BTreeSet::new();
 
 #[unsafe(no_mangle)]
 pub extern "C" fn gum_memory_dispose_writable_pages(writable: gpointer, _n_pages: guint) {
+
     #[cfg(feature = "xnu-kext")]
     if let Some(base) = crate::xnu::the_page_behind(writable as u64) {
         let size = _n_pages as usize * unsafe { gum_query_page_size() } as usize;
@@ -181,7 +227,24 @@ pub extern "C" fn gum_memory_dispose_writable_pages(writable: gpointer, _n_pages
         return;
     }
 
+    if let Some(executable) = aliases().remove(&(writable as u64)) {
+        let size = _n_pages as usize * unsafe { gum_query_page_size() } as usize;
+        unsafe {
+            libc::__clear_cache(executable as *const u8, (executable + size as u64) as *const u8);
+        }
+        return;
+    }
+
     if !shadows().remove(&(writable as u64)) {
+        #[cfg(all(feature = "linux-injected", not(target_arch = "arm")))]
+        {
+            let size = _n_pages as usize * unsafe { gum_query_page_size() } as usize;
+            unsafe {
+                libc::__clear_cache(writable as *const u8,
+                    (writable as u64 + size as u64) as *const u8);
+            }
+        }
+
         return;
     }
     unsafe {
@@ -190,8 +253,12 @@ pub extern "C" fn gum_memory_dispose_writable_pages(writable: gpointer, _n_pages
         let n_pages = *(buffer.add(16) as *const u32);
         let total = n_pages as usize * gum_query_page_size() as usize;
 
-        commit_kernel_patch(first_page, writable as *const u8, total);
-        libc::__clear_cache(first_page as *const u8, (first_page + total as u64) as *const u8);
+        if let Some((offset, len)) = what_changed(first_page, writable as *const u8, total) {
+            commit_kernel_patch(first_page + offset as u64, (writable as *const u8).add(offset),
+                len);
+            libc::__clear_cache((first_page + offset as u64) as *const u8,
+                (first_page + (offset + len) as u64) as *const u8);
+        }
 
         kernel::free(buffer, SHADOW_HEADER + total);
     }
@@ -202,8 +269,22 @@ unsafe fn commit_kernel_patch(address: u64, data: *const u8, len: usize) {
     crate::xnu::write_through_a_writable_alias(address, data, len);
 }
 
-#[cfg(not(feature = "xnu-kext"))]
+#[cfg(all(feature = "linux-injected", not(target_arch = "arm")))]
 unsafe fn commit_kernel_patch(address: u64, data: *const u8, len: usize) {
+    if kernel::patch_text(address, data, len) {
+        return;
+    }
+
+    unsafe { ask_the_host_to_patch(address, data, len) };
+}
+
+#[cfg(all(not(feature = "xnu-kext"), any(not(feature = "linux-injected"), target_arch = "arm")))]
+unsafe fn commit_kernel_patch(address: u64, data: *const u8, len: usize) {
+    unsafe { ask_the_host_to_patch(address, data, len) };
+}
+
+#[cfg(not(feature = "xnu-kext"))]
+unsafe fn ask_the_host_to_patch(address: u64, data: *const u8, len: usize) {
     unsafe {
         let element_type = g_variant_type_new(c"y".as_ptr());
         let bytes = g_variant_new_fixed_array(element_type, data as gconstpointer, len as gsize, 1);
@@ -530,36 +611,49 @@ pub extern "C" fn gum_barebone_on_registry_activating(registry: *mut GumModuleRe
         return;
     }
 
-    let kernel_base = kernel::get_kernel_base();
+    #[cfg(feature = "linux-injected")]
+    {
+        crate::gum_modules::publish(registry);
+        return;
+    }
 
-    unsafe {
-        let module_infos = core::ptr::addr_of!(crate::MODULE_INFO);
-        let module_infos = &*module_infos;
+    #[cfg(not(feature = "linux-injected"))]
+    {
+        let kernel_base = kernel::get_kernel_base();
 
-        let mut i = 0;
-        for module_info in module_infos.iter() {
-            let module_base = kernel_base + module_info.offset as u64;
+        unsafe {
+            let module_infos = core::ptr::addr_of!(crate::MODULE_INFO);
+            let module_infos = &*module_infos;
 
-            let module_path = if i == 0 {
-                KERNEL_PATH
-            } else {
-                &format!(
-                    "{}{}{}",
-                    MODULE_DIRECTORY, module_info.name, MODULE_SUFFIX
-                )
-            };
-            let module_range = GumMemoryRange {
-                base_address: module_base,
-                size: module_info.size as gsize,
-            };
+            let mut i = 0;
+            for module_info in module_infos.iter() {
+                let module_base = kernel_base + module_info.offset as u64;
 
-            let module = gum::gum_native_module_new(&module_path, &module_info.version, &module_range);
-            gum_barebone_register_module(registry, module);
-            g_object_unref(module as gpointer);
+                let module_path = if i == 0 {
+                    KERNEL_PATH
+                } else {
+                    &format!("{}{}{}", MODULE_DIRECTORY, module_info.name, MODULE_SUFFIX)
+                };
+                let module_range = GumMemoryRange {
+                    base_address: module_base,
+                    size: module_info.size as gsize,
+                };
 
-            i += 1;
+                let module =
+                    gum::gum_native_module_new(&module_path, &module_info.version, &module_range);
+                gum_barebone_register_module(registry, module);
+                g_object_unref(module as gpointer);
+
+                i += 1;
+            }
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gum_barebone_on_registry_deactivating(_registry: *mut GumModuleRegistry) {
+    #[cfg(feature = "linux-injected")]
+    crate::gum_modules::unpublish();
 }
 
 #[cfg(any(feature = "linux-injected", feature = "xnu-core"))]
@@ -710,6 +804,11 @@ pub(crate) unsafe fn enumerate_exports_in_range(
     #[cfg(feature = "linux-injected")]
     if kernel::in_copy() {
         kernel::enumerate_exports_in_range(start_address, end_address, callback);
+        return;
+    }
+
+    #[cfg(feature = "linux-injected")]
+    if crate::gum_modules::enumerate_exports_in_module(start_address, callback) {
         return;
     }
 

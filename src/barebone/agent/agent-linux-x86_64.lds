@@ -26,6 +26,13 @@ SECTIONS {
     _kfree = .; . += 8;
     _execmem_alloc = .; . += 8;
     _set_memory_rw = .; . += 8;
+    _set_memory_ro = .; . += 8;
+    _set_memory_x = .; . += 8;
+    _set_memory_nx = .; . += 8;
+    _modules = .; . += 8;
+    _register_module_notifier = .; . += 8;
+    _unregister_module_notifier = .; . += 8;
+    _text_poke_kgdb = .; . += 8;
     _execmem_free = .; . += 8;
     _module_alloc = .; . += 8;
     _module_memfree = .; . += 8;

@@ -104,35 +104,12 @@ pub extern "C" fn gum_memory_free(address: gpointer, size: gsize) -> gboolean {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn gum_barebone_on_registry_activating(registry: *mut GumModuleRegistry) {
-    unsafe {
-        let kernel_base = kernel::get_kernel_base();
-        if kernel_base != 0 {
-            register_module(registry, "/boot/vmlinux", "", kernel_base, kernel::get_kernel_size());
-        }
-
-        for m in kernel::enumerate_modules() {
-            let path = format!("/lib/modules/{}.ko", m.name);
-            register_module(registry, &path, &m.version, m.base, m.size);
-        }
-    }
+    crate::gum_modules::publish(registry);
 }
 
-unsafe fn register_module(
-    registry: *mut GumModuleRegistry,
-    path: &str,
-    version: &str,
-    base: u64,
-    size: u64,
-) {
-    unsafe {
-        let range = GumMemoryRange {
-            base_address: base,
-            size: size as gsize,
-        };
-        let module = gum::gum_native_module_new(path, version, &range);
-        gum_barebone_register_module(registry, module);
-        g_object_unref(module as gpointer);
-    }
+#[unsafe(no_mangle)]
+pub extern "C" fn gum_barebone_on_registry_deactivating(_registry: *mut GumModuleRegistry) {
+    crate::gum_modules::unpublish();
 }
 
 pub(crate) unsafe fn enumerate_exports_in_range(
@@ -140,6 +117,10 @@ pub(crate) unsafe fn enumerate_exports_in_range(
     end_address: u64,
     callback: &mut FoundExportCallback<'_>,
 ) {
+    if crate::gum_modules::enumerate_exports_in_module(start_address, callback) {
+        return;
+    }
+
     kernel::enumerate_symbols(&mut |name, address| {
         if address < start_address || address >= end_address {
             return true;

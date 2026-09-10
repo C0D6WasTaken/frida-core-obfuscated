@@ -6,7 +6,9 @@ use crate::{
         _GInterfaceInfo, _GTypeInfo, GObject, GObjectClass, GPrivate, GType, GumAddress,
         GumExportDetails,
         GumExportType_GUM_EXPORT_FUNCTION, GumFoundExportFunc, GumMemoryRange, GumModule,
-        GumModuleInterface, GumThreadId, GumTlsKey, g_free, g_object_get_type, g_object_new,
+        GumFoundSymbolFunc, GumModuleInterface, GumSymbolDetails, GumSymbolType_GUM_SYMBOL_FUNCTION,
+        GumSymbolType_GUM_SYMBOL_OBJECT, GumSymbolType_GUM_SYMBOL_UNKNOWN, GumThreadId, GumTlsKey,
+        gssize, g_free, g_object_get_type, g_object_new,
         g_once_init_enter, g_once_init_leave, g_strdup, g_type_add_interface_static,
         g_type_class_peek_parent, g_type_register_static, gchar, gboolean, gpointer, gsize, guint,
     },
@@ -21,6 +23,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(feature = "linux")]
 use crate::gum_linux::enumerate_exports_in_range;
+#[cfg(any(feature = "linux", feature = "linux-injected"))]
+use crate::gum_modules::enumerate_symbols_in_range;
 #[cfg(any(feature = "win9x", feature = "winnt"))]
 use crate::gum_windows::enumerate_exports_in_range;
 #[cfg(any(feature = "xnu-core", feature = "linux-injected"))]
@@ -178,6 +182,11 @@ extern "C" fn gum_native_module_iface_init(g_iface: gpointer, _iface_data: gpoin
         (*iface).get_range = Some(crate::signed_to_be_called_back(gum_native_module_get_range, 0));
         (*iface).enumerate_exports = Some(crate::signed_to_be_called_back(gum_native_module_enumerate_exports, 0));
         (*iface).find_export_by_name = Some(crate::signed_to_be_called_back(gum_native_module_find_export_by_name, 0));
+        #[cfg(any(feature = "linux", feature = "linux-injected"))]
+        {
+            (*iface).enumerate_symbols =
+                Some(crate::signed_to_be_called_back(gum_native_module_enumerate_symbols, 0));
+        }
     }
 }
 
@@ -198,18 +207,27 @@ pub(crate) fn gum_native_module_new(
 ) -> *mut GumModule {
     unsafe {
         let path_cstr = CString::new(path).unwrap();
-        let version_cstr = CString::new(version).unwrap();
 
         let module =
             g_object_new(gum_native_module_get_type(), ptr::null()) as *mut GumNativeModule;
         (*module).path = g_strdup(path_cstr.as_ptr());
         let name_offset = path.rfind(['/', '\\']).map_or(0, |at| at + 1);
         (*module).name = (*module).path.add(name_offset);
-        (*module).version = g_strdup(version_cstr.as_ptr());
+        (*module).version = version_copied(version);
         (*module).range = *range;
 
         module as *mut GumModule
     }
+}
+
+fn version_copied(version: &str) -> *mut gchar {
+    if version.is_empty() {
+        return ptr::null_mut();
+    }
+
+    let copy = CString::new(version).unwrap();
+
+    unsafe { g_strdup(copy.as_ptr()) }
 }
 
 extern "C" fn gum_native_module_get_name(module: *mut GumModule) -> *const gchar {
@@ -280,7 +298,7 @@ unsafe extern "C" fn gum_native_module_enumerate_exports(
         let mut on_export = |name: *const gchar, address: u64| {
             let export_details = GumExportDetails {
                 type_: GumExportType_GUM_EXPORT_FUNCTION,
-                name: g_strdup(name),
+                name,
                 address,
                 size: -1,
             };
@@ -295,6 +313,52 @@ unsafe extern "C" fn gum_native_module_enumerate_exports(
         );
     }
 }
+
+#[cfg(any(feature = "linux", feature = "linux-injected"))]
+unsafe extern "C" fn gum_native_module_enumerate_symbols(
+    self_: *mut GumModule,
+    func: GumFoundSymbolFunc,
+    user_data: gpointer,
+) {
+    unsafe {
+        let module = self_ as *mut GumNativeModule;
+        let range = (*module).range;
+
+        let mut on_symbol = |name: *const gchar, address: u64, size: u64, kind: u8, global: bool| {
+            let details = GumSymbolDetails {
+                is_global: global as gboolean,
+                type_: match kind {
+                    SYMBOL_IS_FUNCTION => GumSymbolType_GUM_SYMBOL_FUNCTION,
+                    SYMBOL_IS_OBJECT => GumSymbolType_GUM_SYMBOL_OBJECT,
+                    _ => GumSymbolType_GUM_SYMBOL_UNKNOWN,
+                },
+                section: ptr::null(),
+                name,
+                address,
+                size: size as gssize,
+            };
+
+            func.unwrap()(&details as *const GumSymbolDetails, user_data) != 0
+        };
+
+        enumerate_symbols_in_range(
+            range.base_address,
+            range.base_address + range.size as u64,
+            &mut on_symbol,
+        );
+    }
+}
+
+/// What the backends implement for `gum_native_module_enumerate_symbols`: call
+/// `callback` for every symbol in `[start, end)`, stopping early when it returns
+/// false.
+#[cfg(any(feature = "linux", feature = "linux-injected"))]
+pub(crate) type FoundSymbolCallback<'a> = dyn FnMut(*const gchar, u64, u64, u8, bool) -> bool + 'a;
+
+#[cfg(any(feature = "linux", feature = "linux-injected"))]
+const SYMBOL_IS_OBJECT: u8 = 1;
+#[cfg(any(feature = "linux", feature = "linux-injected"))]
+const SYMBOL_IS_FUNCTION: u8 = 2;
 
 /// What the backends implement for `gum_native_module_enumerate_exports`: call
 /// `callback` for every exported function in `[start, end)`, stopping early when
